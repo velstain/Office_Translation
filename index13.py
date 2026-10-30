@@ -856,6 +856,10 @@ def extract_texts_from_pdf(pdf):
 
     for page_index, page in enumerate(pdf):
         data = page.get_text("dict")
+        # 带 /Rotate 的页面：get_text 返回"未旋转"坐标，而分组/写回/图片检测统一用
+        # "视觉坐标"（旋转后）。先把所有坐标映射到视觉空间（rotation_matrix），
+        # 否则旋转页会文本组碎片化、写回文本被旋转 90°（纵向排列）——见 261009 案例。
+        _rot_m = page.rotation_matrix if page.rotation else None
         block_order = 0
 
         for block in data["blocks"]:
@@ -877,13 +881,15 @@ def extract_texts_from_pdf(pdf):
                     if not stripped:
                         continue
                     span_texts.append(text)
-                    span_bboxes.append(fitz.Rect(span["bbox"]))
+                    _bbox = fitz.Rect(span["bbox"])
+                    span_bboxes.append(_bbox * _rot_m if _rot_m else _bbox)
                     max_fontsize = max(max_fontsize, span["size"])
                     max_flags |= span.get("flags", 0)
                     if not font:
                         font = span.get("font", "")
                     if origin is None and "origin" in span:
-                        origin = fitz.Point(span["origin"])
+                        _org = fitz.Point(span["origin"])
+                        origin = _org * _rot_m if _rot_m else _org
                     c = span.get("color")
                     if c is not None and text_color is None:
                         text_color = c
@@ -936,8 +942,10 @@ def extract_texts_from_pdf(pdf):
     page_images = {}
     for p in pdf:
         img_rects = []
+        _p_rot = p.rotation_matrix if p.rotation else None
         for im in p.get_images(full=True):
-            img_rects.extend(p.get_image_rects(im[0]))
+            _irs = p.get_image_rects(im[0])
+            img_rects.extend([r * _p_rot for r in _irs] if _p_rot else _irs)
         page_images[p.number] = img_rects
 
     def _row_on_image(pg, r):
@@ -1047,13 +1055,16 @@ def _group_lines_into_cells(lines, pdf):
         cell_rects = []
         table_ok = False
 
-        # 尝试表格检测
+        # 尝试表格检测（坐标同样在"未旋转"空间 → 转视觉坐标与行坐标一致）
         try:
-            tables = pdf[page_id].find_tables()
+            _tpage = pdf[page_id]
+            _trot = _tpage.rotation_matrix if _tpage.rotation else None
+            tables = _tpage.find_tables()
             if tables and tables.tables:
                 for t in tables.tables:
                     for c in t.cells:
-                        cell_rects.append(fitz.Rect(c))
+                        _cr = fitz.Rect(c)
+                        cell_rects.append(_cr * _trot if _trot else _cr)
                 table_ok = len(cell_rects) > 0
         except Exception:
             table_ok = False
@@ -1415,8 +1426,11 @@ def apply_translations_to_pdf(pdf, groups, translation_map, scanned=False, scann
         area = p.rect.width * p.rect.height
         full = False
         imgs = []
+        _p_rot = p.rotation_matrix if p.rotation else None
         for im in p.get_images(full=True):
             for r in p.get_image_rects(im[0]):
+                if _p_rot:
+                    r = r * _p_rot
                 imgs.append(r)
                 if area > 0 and (r.width * r.height) > area * 0.6:
                     full = True
@@ -1561,22 +1575,57 @@ def apply_translations_to_pdf(pdf, groups, translation_map, scanned=False, scann
 
         # 涂白所有原文本行（原文区±1pt 全覆盖——即使该行没有对应译文行，
         # 避免中文译文比原文短时露出后半原文（日文残留））
-        for row in rows:
-            r = row["rect"]
-            on_image = False
-            for img in page_images.get(pg, []):
-                if (r.x0 < img.x1 and r.x1 > img.x0 and
-                        r.y0 < img.y1 and r.y1 > img.y0):
-                    on_image = True
-                    break
-            if _is_scanned_page(pg) and page_fullimage.get(pg):
-                on_image = False  # 整页图为扫描底（非照片），允许涂白
-            bg = (1, 1, 1)
-            if not on_image and pm is not None:
-                bg = sample_bg_color(pm, r)
-            cx0, cy0, cx1, cy1 = _cover_rect_pad(r)
-            page.draw_rect(_vis_rect(page, fitz.Rect(cx0, cy0, cx1, cy1)),
-                           color=bg, fill=bg, overlay=True)
+        # 整页扫描底图（文字层可能是电子版/OCR，与底图存在偏移）时，逐行白块盖不严 →
+        # 组内无照片时改用"组矩形大块涂白"（如静電群馬"发生情况"大段文字叠加）
+        _page_area = page.rect.width * page.rect.height
+        _gr = group["rect"]
+        _gr_on_img = False
+        _gr_img_area = 0.0
+        for img in page_images.get(pg, []):
+            if _page_area > 0 and (img.width * img.height) > _page_area * 0.6:
+                continue  # 整页扫描底图不算"照片"（其文字需要被涂白）
+            ix0 = max(_gr.x0, img.x0)
+            iy0 = max(_gr.y0, img.y0)
+            ix1 = min(_gr.x1, img.x1)
+            iy1 = min(_gr.y1, img.y1)
+            if ix1 > ix0 and iy1 > iy0:
+                _gr_on_img = True
+                _gr_img_area += (ix1 - ix0) * (iy1 - iy0)
+        _gr_area = max(_gr.width * _gr.height, 1)
+        # 与照片重叠 <10% 时仍用组块涂白（大段文字逐行白块盖不严扫描底偏移）
+        _block_paint = bool(page_fullimage.get(pg)) and (
+            not _gr_on_img or (_gr_img_area / _gr_area) < 0.1)
+
+        if _block_paint:
+            _bg = (1, 1, 1)
+            if pm is not None:
+                _bg = sample_bg_color(pm, _gr)
+            _sh = page.new_shape()
+            _sh.draw_rect(_vis_rect(page, fitz.Rect(_gr.x0 - 0.5, _gr.y0 - 0.5,
+                                                    _gr.x1 + 0.5, _gr.y1 + 0.5)))
+            _sh.finish(color=_bg, fill=_bg, width=0.5)
+            _sh.commit(overlay=True)
+        else:
+            for row in rows:
+                r = row["rect"]
+                on_image = False
+                for img in page_images.get(pg, []):
+                    if (r.x0 < img.x1 and r.x1 > img.x0 and
+                            r.y0 < img.y1 and r.y1 > img.y0):
+                        on_image = True
+                        break
+                if _is_scanned_page(pg) and page_fullimage.get(pg):
+                    on_image = False  # 整页图为扫描底（非照片），允许涂白
+                bg = (1, 1, 1)
+                if not on_image and pm is not None:
+                    bg = sample_bg_color(pm, r)
+                cx0, cy0, cx1, cy1 = _cover_rect_pad(r)
+                # 用 Shape.commit(overlay=True) 而非 page.draw_rect：后者在本 PyMuPDF 版本
+                # 对"扫描底图+OCR 文字层"的 PDF 实际落在背景层，盖不住图片上的原文（261009 案例）
+                _sh = page.new_shape()
+                _sh.draw_rect(_vis_rect(page, fitz.Rect(cx0, cy0, cx1, cy1)))
+                _sh.finish(color=bg, fill=bg, width=0.5)
+                _sh.commit(overlay=True)
 
         # 再涂白每条译文行实际矩形（尺寸由译文文本决定，确保译文底色与其区域一致）
         for i, line in enumerate(lines):
@@ -1598,8 +1647,10 @@ def apply_translations_to_pdf(pdf, groups, translation_map, scanned=False, scann
             # 译文区竖直带与原文区统一（横扩按译文宽度）；基线在带内，
             # 避免译文区向下越入表格线
             cx0, cy0, cx1, cy1 = _cover_rect_pad(r)
-            page.draw_rect(_vis_rect(page, fitz.Rect(x - 1.2, cy0, x + wid + 1.2, cy1)),
-                           color=bg, fill=bg, overlay=True)
+            _sh = page.new_shape()
+            _sh.draw_rect(_vis_rect(page, fitz.Rect(x - 1.2, cy0, x + wid + 1.2, cy1)))
+            _sh.finish(color=bg, fill=bg, width=0.5)
+            _sh.commit(overlay=True)
 
     # ========== 阶段2：按组写翻译文本（用阶段1的计划，坐标预计算好了） ==========
     small_count = 0          # 译文被缩到 7pt 以下的组数（结束时汇总提醒）
@@ -2522,8 +2573,11 @@ def _add_group_textbox(doc, text, group, page_w_pt, page_h_pt, page, pm, did, ru
     # 底色：框=原文区，底色克隆（照片上标注（与图相交）→ 白）
     on_image = False
     try:
+        _p_rot = page.rotation_matrix if page.rotation else None
         for im in page.get_images(full=True):
             for ir in page.get_image_rects(im[0]):
+                if _p_rot:
+                    ir = ir * _p_rot
                 if (rect.x0 < ir.x1 and rect.x1 > ir.x0 and
                         rect.y0 < ir.y1 and rect.y1 > ir.y0):
                     on_image = True
@@ -2650,6 +2704,7 @@ def _make_cleaned_bg(pdf_page, page_idx, groups, pm2, zoom=150 / 72):
     pix = pdf_page.get_pixmap(dpi=150)
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     arr = np.asarray(img).copy()
+    _bg_rot = pdf_page.rotation_matrix if pdf_page.rotation else None
 
     for g in groups:
         for row in g["rows"]:
@@ -2662,6 +2717,8 @@ def _make_cleaned_bg(pdf_page, page_idx, groups, pm2, zoom=150 / 72):
             try:
                 for im in pdf_page.get_images(full=True):
                     for ir in pdf_page.get_image_rects(im[0]):
+                        if _bg_rot:
+                            ir = ir * _bg_rot
                         if (r.x0 < ir.x1 and r.x1 > ir.x0 and
                                 r.y0 < ir.y1 and r.y1 > ir.y0):
                             on_image = True
