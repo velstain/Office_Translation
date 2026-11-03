@@ -1,0 +1,52 @@
+# Python / 虚拟环境
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包产物
+build/
+dist/
+*.spec.bak
+
+# 中间/交付产物（由用户自行管理，不入版本库）
+filesave/
+tmp_*
+_gui_test.png
+cmp_*
+vline_*
+# 样例与输出文件（体积大）
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+*.png
+*.jpg
+
+# 但图标需要跟踪
+!icon/download.png
+
+# 旧版本备份 / 一次性测试脚本（本地保留、不追踪）
+index.py
+index[0-9]*.py
+index13-old.py
+index*.spec
+test_*.py
+test*.py
+*_test.py
+test_*.json
+repro_*.py
+diag_*.py
+debug_*.py
+render_*.py
+pos_*.py
+diff_*.py
+getModelName.py
+*.bak
+*.gbk.bak
+font/
+example/
+
+# 例外：主程序 / 当前打包配置
+!index13.py
+!index13.spec
